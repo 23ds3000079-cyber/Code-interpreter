@@ -7,15 +7,12 @@ import traceback
 import re
 import os
 
-# Gemini
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
+# ---------- CORS ----------
 from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,16 +21,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Request Model ----------------
+# ---------- OpenAI Client ----------
+client = OpenAI(api_key="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")
+
+# ---------- Request Model ----------
 class CodeRequest(BaseModel):
     code: str
 
 
-# ---------------- Tool Function ----------------
+# ---------- Tool Function ----------
 def execute_python_code(code: str) -> dict:
-    """
-    Executes Python code and returns exact stdout or traceback.
-    """
     old_stdout = sys.stdout
     sys.stdout = StringIO()
 
@@ -50,34 +47,17 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = old_stdout
 
 
-# ---------------- AI Schema ----------------
-class ErrorAnalysis(BaseModel):
-    error_lines: List[int]
-
-
-# ---------------- Fallback parser ----------------
-def extract_line_numbers_from_traceback(tb: str) -> List[int]:
-    """
-    Extract only user-code line numbers from traceback.
-    Filters out internal framework lines.
-    """
+# ---------- Fallback parser ----------
+def extract_line_numbers(tb: str) -> List[int]:
     matches = re.findall(r'File "<string>", line (\d+)', tb)
-    lines = sorted(set(int(x) for x in matches))
-    return lines
+    return sorted(set(int(x) for x in matches))
 
 
-# ---------------- AI Analyzer ----------------
+# ---------- AI Analyzer ----------
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
-    """
-    Uses Gemini only when needed.
-    Falls back safely if AI fails.
-    """
     try:
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
         prompt = f"""
-Analyze Python code and its traceback.
-Return ONLY the line number(s) where the error occurs.
+Identify the line number(s) where the error occurred.
 
 CODE:
 {code}
@@ -86,35 +66,36 @@ TRACEBACK:
 {tb}
 """
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "error_lines": types.Schema(
-                            type=types.Type.ARRAY,
-                            items=types.Schema(type=types.Type.INTEGER),
-                        )
-                    },
-                    required=["error_lines"],
-                ),
-            ),
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "error_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "error_lines": {
+                                "type": "array",
+                                "items": {"type": "integer"}
+                            }
+                        },
+                        "required": ["error_lines"]
+                    }
+                }
+            }
         )
 
-        parsed = ErrorAnalysis.model_validate_json(response.text)
-
-        # clean + validate AI output
-        lines = sorted(set(parsed.error_lines))
-        return lines if lines else extract_line_numbers_from_traceback(tb)
+        data = response.output_parsed
+        lines = sorted(set(data["error_lines"]))
+        return lines if lines else extract_line_numbers(tb)
 
     except Exception:
-        return extract_line_numbers_from_traceback(tb)
+        return extract_line_numbers(tb)
 
 
-# ---------------- Endpoint ----------------
+# ---------- Endpoint ----------
 @app.post("/code-interpreter")
 def run_code(req: CodeRequest):
 
@@ -127,7 +108,7 @@ def run_code(req: CodeRequest):
             "result": execution["output"]
         }
 
-    # ERROR → analyze
+    # ERROR → AI analyze
     error_lines = analyze_error_with_ai(req.code, execution["output"])
 
     return {
